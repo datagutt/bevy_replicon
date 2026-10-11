@@ -1,5 +1,6 @@
 pub mod client_visibility;
 pub mod filters_mask;
+pub(crate) mod index;
 pub mod registry;
 
 use bevy::{ecs::entity_disabling::Disabled, prelude::*};

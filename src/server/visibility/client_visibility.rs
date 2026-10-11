@@ -21,6 +21,19 @@ pub struct ClientVisibility {
     /// Stored redundantly to quickly iterate only over entities
     /// with newly hidden data.
     lost: EntityHashMap<FiltersMask>,
+
+    /// Entities whose mask changed since the last
+    /// [`VisibilityIndex`](super::index::VisibilityIndex) update.
+    ///
+    /// May contain duplicates.
+    #[reflect(ignore)]
+    pub(crate) changed: Vec<Entity>,
+
+    /// Position of this client in [`VisibilityIndex`](super::index::VisibilityIndex).
+    ///
+    /// Assigned on the first index update after insertion.
+    #[reflect(ignore)]
+    pub(crate) slot: Option<usize>,
 }
 
 impl ClientVisibility {
@@ -143,6 +156,9 @@ impl ClientVisibility {
     pub fn set(&mut self, entity: Entity, bit: FilterBit, visible: bool) {
         if visible {
             if let Entry::Occupied(mut mask) = self.hidden.entry(entity) {
+                if mask.get().contains(bit) {
+                    self.changed.push(entity);
+                }
                 mask.get_mut().remove(bit);
                 if mask.get().is_empty() {
                     mask.remove();
@@ -159,6 +175,7 @@ impl ClientVisibility {
             let mask = self.hidden.entry(entity).or_default();
             if !mask.contains(bit) {
                 mask.insert(bit);
+                self.changed.push(entity);
                 self.lost.entry(entity).or_default().insert(bit);
             }
         }

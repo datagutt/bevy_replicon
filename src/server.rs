@@ -7,14 +7,16 @@ mod replication_query;
 pub mod server_tick;
 pub mod visibility;
 
-use core::time::Duration;
+use core::{ops::Range, time::Duration};
 
 use bevy::{
     ecs::{
         archetype::Archetypes,
-        change_detection::{CheckChangeTicks, Tick},
+        change_detection::{CheckChangeTicks, ComponentTicks, Tick},
+        component::ComponentId,
         entity::{Entities, EntityHash, EntityHashMap},
         intern::Interned,
+        lifecycle::Discard,
         schedule::ScheduleLabel,
         system::SystemChangeTick,
     },
@@ -31,7 +33,11 @@ use crate::{
     server::{
         replicated_archetypes::ReplicatedArchetypes,
         replication_messages::{mutations::MutationsSplit, serialized_data::ErasedComponent},
-        visibility::registry::FilterRegistry,
+        visibility::{
+            filters_mask::FiltersMask,
+            index::{SlotMask, VisibilityIndex},
+            registry::FilterRegistry,
+        },
     },
     shared::{
         backend::channels::ClientChannel,
@@ -43,7 +49,7 @@ use crate::{
                 ComponentIndex, ReplicationRegistry, component_mask::ComponentMask,
                 ctx::SerializeCtx,
             },
-            rules::ReplicationRules,
+            rules::{ReplicationRules, component::ComponentRule},
             storage::ReplicationStorage,
             visibility::VisibilityScope,
         },
@@ -140,6 +146,7 @@ impl Plugin for ServerPlugin {
             .init_resource::<MessageBuffer>()
             .init_resource::<RelatedEntities>()
             .init_resource::<FilterRegistry>()
+            .init_resource::<VisibilityIndex>()
             .register_required_components::<Replicated, TicksTracked>()
             .insert_resource(TrackMutateMessages(self.track_mutate_messages))
             .configure_sets(
@@ -161,6 +168,7 @@ impl Plugin for ServerPlugin {
             .add_observer(buffer_despawn)
             .add_observer(cleanup_unreplicated)
             .add_observer(cleanup_storage)
+            .add_observer(release_visibility_slot)
             .add_systems(
                 PreUpdate,
                 (
@@ -179,6 +187,7 @@ impl Plugin for ServerPlugin {
                     collect_mappings,
                     collect_despawns,
                     collect_removals,
+                    update_visibility_index,
                     collect_changes,
                     send_messages,
                 )
@@ -280,7 +289,12 @@ fn check_protocol(
     }
 }
 
-fn check_mutation_ticks(check: On<CheckChangeTicks>, mut clients: Query<&mut ClientTicks>) {
+fn check_mutation_ticks(
+    check: On<CheckChangeTicks>,
+    mut index: ResMut<VisibilityIndex>,
+    mut clients: Query<&mut ClientTicks>,
+) {
+    index.check_change_ticks(*check);
     debug!(
         "checking mutation ticks for overflow for {:?}",
         check.present_tick()
@@ -355,10 +369,12 @@ fn cleanup_unreplicated(
     despawn: On<Despawn, TicksTracked>,
     state: Res<State<ServerState>>,
     replicated: Query<&Replicated>,
+    mut index: ResMut<VisibilityIndex>,
     mut clients: Query<&mut ClientTicks>,
 ) {
     if *state == ServerState::Running && !replicated.contains(despawn.entity) {
         trace!("cleaning up ticks for despawned `{}`", despawn.entity);
+        index.remove(despawn.entity);
         for mut ticks in &mut clients {
             ticks.entities.remove(&despawn.entity);
         }
@@ -477,6 +493,7 @@ fn should_send_mapping(
 /// Collect entity despawns from this tick into update messages.
 fn collect_despawns(
     registry: Res<FilterRegistry>,
+    mut index: ResMut<VisibilityIndex>,
     mut serialized: ResMut<SerializedData>,
     mut despawn_buffer: ResMut<DespawnBuffer>,
     mut clients: Query<(
@@ -488,6 +505,7 @@ fn collect_despawns(
     )>,
 ) -> Result<()> {
     for entity in despawn_buffer.drain(..) {
+        index.remove(entity);
         let entity_range = serialized.write_entity(entity)?;
         for (client, mut message, mut ticks, mut priority, mut visibility) in &mut clients {
             let hidden_lifetime = visibility.get(entity).hidden_entity_lifetime(&registry);
@@ -668,7 +686,41 @@ fn collect_removals(
     Ok(())
 }
 
+/// Applies [`ClientVisibility`] changes to [`VisibilityIndex`].
+fn update_visibility_index(
+    change_tick: Res<ServerChangeTick>,
+    filter_registry: Res<FilterRegistry>,
+    mut index: ResMut<VisibilityIndex>,
+    mut clients: Query<(&mut ClientVisibility, Has<ClientTicks>)>,
+) {
+    index.clear_released();
+    for (mut visibility, replicated) in &mut clients {
+        if replicated {
+            if visibility.slot.is_none() || !visibility.changed.is_empty() {
+                index.update(&filter_registry, &mut visibility, **change_tick);
+            }
+        } else if !visibility.changed.is_empty() {
+            // Clients without ticks don't receive replication, so they need no slot.
+            visibility.changed.clear();
+        }
+    }
+}
+
+fn release_visibility_slot(
+    discard: On<Discard, ClientVisibility>,
+    clients: Query<&ClientVisibility>,
+    mut index: ResMut<VisibilityIndex>,
+) {
+    if let Some(slot) = clients.get(discard.entity).ok().and_then(|v| v.slot) {
+        index.release(slot);
+    }
+}
+
 /// Collects component changes from this tick into update and mutate messages since the last entity tick.
+///
+/// For each entity, only clients that can see it are visited, using [`VisibilityIndex`].
+/// For each visited client, the visibility and ticks for the entity are looked up once
+/// and then checked against all of its components.
 fn collect_changes(
     archetypes: &Archetypes,
     query: ReplicationQuery,
@@ -680,6 +732,7 @@ fn collect_changes(
     related_entities: Res<RelatedEntities>,
     rules: Res<ReplicationRules>,
     receive_markers: Res<ReceiveMarkers>,
+    index: Res<VisibilityIndex>,
     mut replication_storage: ResMut<ReplicationStorage>,
     mut replicated_archetypes: ResMut<ReplicatedArchetypes>,
     mut serialized: ResMut<SerializedData>,
@@ -689,24 +742,51 @@ fn collect_changes(
         &mut Updates,
         &mut Mutations,
         &mut ClientTicks,
-        &mut PriorityMap,
-        &mut ClientVisibility,
+        &PriorityMap,
+        &ClientVisibility,
     )>,
 ) -> Result<()> {
     replicated_archetypes.update(archetypes, &rules, &receive_markers);
 
+    let mut active_slots = SlotMask::default();
+    let mut slots = Vec::new();
+    for (client, updates, mutations, ticks, priority_map, visibility) in &mut clients {
+        let Some(slot) = visibility.slot else {
+            debug_assert!(
+                false,
+                "`{client}` should have a slot after the index update"
+            );
+            continue;
+        };
+        if slot >= slots.len() {
+            slots.resize_with(slot + 1, || None);
+        }
+        active_slots.set(slot, true);
+        slots[slot] = Some(ReplicationClient {
+            entity: client,
+            updates: updates.into_inner(),
+            mutations: mutations.into_inner(),
+            ticks: ticks.into_inner(),
+            priority_map,
+            visibility,
+        });
+    }
+
+    let mut components = Vec::new();
+    let mut hidden_lifetimes = HiddenLifetimes::default();
     for replicated_archetype in replicated_archetypes.iter() {
         // SAFETY: all IDs from replicated archetypes obtained from real archetypes.
         let archetype = unsafe { archetypes.get(replicated_archetype.id).unwrap_unchecked() };
 
         for entity in archetype.entities() {
-            let mut entity_range = None;
-            let entity_priority = query.get_priority(entity, archetype.table_id());
-            for (_, mut updates, mut mutations, ..) in &mut clients {
-                updates.start_entity_changes();
-                mutations.start_entity();
+            let mut visible_slots = active_slots
+                .iter_except(index.hidden(entity.id()))
+                .peekable();
+            if visible_slots.peek().is_none() {
+                continue;
             }
 
+            components.clear();
             for &(rule, storage) in &replicated_archetype.components {
                 let (component_index, component_id, fns) = registry.get(rule.fns_id);
 
@@ -720,144 +800,206 @@ fn collect_changes(
                     )
                 };
 
-                // SAFETY: `fns` and `ptr` were created for the same component type.
-                let mut component = unsafe { ErasedComponent::new(fns, ptr, rule.fns_id) };
+                components.push(EntityComponent {
+                    rule,
+                    index: component_index,
+                    id: component_id,
+                    // SAFETY: `fns` and `ptr` were created for the same component type.
+                    erased: unsafe { ErasedComponent::new(fns, ptr, rule.fns_id) },
+                    ticks,
+                    range: None,
+                });
+            }
 
-                let mut ctx = SerializeCtx {
-                    entity: entity.id(),
-                    component_id,
-                    last_changed: ticks.changed,
-                    server_tick: **server_tick,
-                    diff_cursor: None,
-                    type_registry: &type_registry,
-                    storage: &mut replication_storage,
+            hidden_lifetimes.clear();
+            let latest_change = components
+                .iter()
+                .map(|component| component.ticks.changed)
+                .reduce(|latest, changed| {
+                    if changed.is_newer_than(latest, **change_tick) {
+                        changed
+                    } else {
+                        latest
+                    }
+                });
+            let visibility_change = index.changed_at(entity.id());
+            let mut entity_range = None;
+            let entity_priority = query.get_priority(entity, archetype.table_id());
+            let graph_index = related_entities.graph_index(entity.id());
+            let has_removals = removal_buffer.contains_key(&entity.id());
+            for slot in visible_slots {
+                // SAFETY: only slots of collected clients are set in `active_slots`.
+                let client = unsafe { slots[slot].as_mut().unwrap_unchecked() };
+
+                let entity_ticks = client.ticks.entities.entry(entity.id());
+                let current_ticks = match &entity_ticks {
+                    Entry::Occupied(entry) => Some(entry.get()),
+                    Entry::Vacant(_) => None,
                 };
 
-                let mut component_range = None;
-                for (client, mut updates, mut mutations, client_ticks, priority_map, visibility) in
-                    &mut clients
+                // Skip clients that have the latest state of the entity. The client's entity tick is
+                // only set on ticks where all of the entity's changes and insertions were written for it,
+                // so nothing changed, was inserted, or became visible since then.
+                if let Some(current_ticks) = current_ticks
+                    && !has_removals
+                    && [latest_change, visibility_change]
+                        .into_iter()
+                        .flatten()
+                        .all(|tick| !tick.is_newer_than(current_ticks.system_tick, **change_tick))
                 {
-                    let hidden_lifetime = visibility
-                        .get(entity.id())
-                        .hidden_component_lifetime(&filter_registry, component_index);
+                    continue;
+                }
+
+                let new_for_client = current_ticks.is_none();
+
+                let (hidden_lifetime, component_lifetimes) = hidden_lifetimes.get(
+                    client.visibility.get(entity.id()),
+                    &filter_registry,
+                    &components,
+                );
+                if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
+                    debug_assert!(false, "`{}` should be hidden by the index", entity.id());
+                    continue;
+                }
+
+                let starts_replication = new_for_client
+                    && hidden_lifetime.is_none_or(|l| l == ScopeLifetime::AlwaysPresent);
+
+                client.updates.start_entity_changes();
+                client.mutations.start_entity();
+
+                let mut base_priority = None;
+                for (component, &hidden_lifetime) in components.iter_mut().zip(component_lifetimes)
+                {
                     if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
                         continue;
                     }
 
-                    let entity_ticks = client_ticks.entities.get(&entity.id());
-                    let new_for_client = entity_ticks.is_none();
+                    let mut ctx = SerializeCtx {
+                        entity: entity.id(),
+                        component_id: component.id,
+                        last_changed: component.ticks.changed,
+                        server_tick: **server_tick,
+                        diff_cursor: None,
+                        type_registry: &type_registry,
+                        storage: &mut replication_storage,
+                    };
 
-                    if let Some(entity_ticks) = entity_ticks
-                        && entity_ticks.components.contains(component_index)
+                    if let Some(current_ticks) = current_ticks
+                        && current_ticks.components.contains(component.index)
                     {
-                        let base_priority = priority_map
-                            .get(&entity.id())
-                            .copied()
-                            .or(entity_priority)
-                            .unwrap_or(1.0);
+                        let base_priority = *base_priority.get_or_insert_with(|| {
+                            client
+                                .priority_map
+                                .get(&entity.id())
+                                .copied()
+                                .or(entity_priority)
+                                .unwrap_or(1.0)
+                        });
 
-                        let tick_diff = **server_tick - entity_ticks.server_tick;
+                        let tick_diff = **server_tick - current_ticks.server_tick;
                         if hidden_lifetime.is_none()
-                            && rule.mode != ReplicationMode::Once
+                            && component.rule.mode != ReplicationMode::Once
                             && base_priority * tick_diff as f32 >= 1.0
-                            && ticks.is_changed(entity_ticks.system_tick, **change_tick)
+                            && component
+                                .ticks
+                                .is_changed(current_ticks.system_tick, **change_tick)
                         {
                             trace!(
-                                "writing `{:?}` mutation for `{}` for client `{client}`",
-                                rule.fns_id,
+                                "writing `{:?}` mutation for `{}` for client `{}`",
+                                component.rule.fns_id,
                                 entity.id(),
+                                client.entity,
                             );
 
-                            if !mutations.entity_added() {
-                                let graph_index = related_entities.graph_index(entity.id());
+                            if !client.mutations.entity_added() {
                                 let entity_range = serialized
                                     .write_cached_entity(&mut entity_range, entity.id())?;
-                                mutations.add_entity(entity.id(), graph_index, entity_range);
+                                client
+                                    .mutations
+                                    .add_entity(entity.id(), graph_index, entity_range);
                             }
 
-                            let diff_cursor = entity_ticks.diff_cursor(component_index);
+                            let diff_cursor = current_ticks.diff_cursor(component.index);
                             let component_range = if diff_cursor.is_none() {
                                 // Cache only full component snapshots.
                                 serialized.write_cached_component(
                                     &mut ctx,
-                                    &mut component_range,
-                                    &mut component,
+                                    &mut component.range,
+                                    &mut component.erased,
                                 )?
                             } else {
                                 ctx.diff_cursor = diff_cursor;
-                                let range = serialized.write_component(&mut ctx, &mut component)?;
+                                let range =
+                                    serialized.write_component(&mut ctx, &mut component.erased)?;
                                 if let Some(cursor) = ctx.diff_cursor.take() {
-                                    mutations.add_diff_cursor(component_index, cursor);
+                                    client.mutations.add_diff_cursor(component.index, cursor);
                                 }
                                 range
                             };
-                            mutations.add_component(component_range);
+                            client.mutations.add_component(component_range);
                         }
-                    } else if hidden_lifetime
-                        .is_none_or(|l| l == ScopeLifetime::AlwaysPresent && new_for_client)
-                    {
+                    } else if is_insertion(
+                        current_ticks,
+                        component.index,
+                        hidden_lifetime,
+                        new_for_client,
+                    ) {
                         trace!(
-                            "writing `{:?}` insertion for `{}` for client `{client}`",
-                            rule.fns_id,
+                            "writing `{:?}` insertion for `{}` for client `{}`",
+                            component.rule.fns_id,
                             entity.id(),
+                            client.entity,
                         );
 
-                        if !updates.changed_entity_added() {
+                        if !client.updates.changed_entity_added() {
                             let entity_range =
                                 serialized.write_cached_entity(&mut entity_range, entity.id())?;
-                            updates.add_changed_entity(entity_range);
+                            client.updates.add_changed_entity(entity_range);
                         }
                         let component_range = serialized.write_cached_component(
                             &mut ctx,
-                            &mut component_range,
-                            &mut component,
+                            &mut component.range,
+                            &mut component.erased,
                         )?;
-                        updates.add_inserted_component(component_range, component_index);
+                        client
+                            .updates
+                            .add_inserted_component(component_range, component.index);
                     }
                 }
-            }
 
-            for (client, mut updates, mut mutations, mut ticks, _, visibility) in &mut clients {
-                let hidden_lifetime = visibility
-                    .get(entity.id())
-                    .hidden_entity_lifetime(&filter_registry);
-                if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
-                    continue;
-                }
-
-                let entity_ticks = ticks.entities.entry(entity.id());
-                let new_for_client = matches!(entity_ticks, Entry::Vacant(_));
-                let has_insertions = updates.changed_entity_added();
-                let has_removals = removal_buffer.contains_key(&entity.id());
-                let starts_replication = new_for_client
-                    && hidden_lifetime.is_none_or(|l| l == ScopeLifetime::AlwaysPresent);
-
+                let has_insertions = client.updates.changed_entity_added();
                 if starts_replication || has_insertions || has_removals {
                     // If there is any insertion, removal, or it's a new entity for a client, include all mutations
                     // into update message and bump the last acknowledged tick to keep entity updates atomic.
-                    if mutations.entity_added() {
+                    if client.mutations.entity_added() {
                         trace!(
-                            "merging mutations for `{}` with updates for client `{client}`",
-                            entity.id()
+                            "merging mutations for `{}` with updates for client `{}`",
+                            entity.id(),
+                            client.entity,
                         );
-                        updates.take_added_entity(&mut mutations);
+                        client.updates.take_added_entity(client.mutations);
                     }
 
                     update_ticks(
                         entity_ticks,
                         **change_tick,
                         **server_tick,
-                        updates.take_changed_components(),
+                        client.updates.take_changed_components(),
                     );
                 }
 
                 if starts_replication && !has_insertions {
-                    trace!("writing empty `{}` for client `{client}`", entity.id());
+                    trace!(
+                        "writing empty `{}` for client `{}`",
+                        entity.id(),
+                        client.entity
+                    );
 
                     // Force-write new entity even if it doesn't have any components.
                     let entity_range =
                         serialized.write_cached_entity(&mut entity_range, entity.id())?;
-                    updates.add_changed_entity(entity_range);
+                    client.updates.add_changed_entity(entity_range);
                 }
             }
         }
@@ -866,6 +1008,108 @@ fn collect_changes(
     removal_buffer.clear();
 
     Ok(())
+}
+
+/// Returns `true` if a component should be sent as an insertion to a client.
+fn is_insertion(
+    entity_ticks: Option<&EntityTicks>,
+    component_index: ComponentIndex,
+    hidden_lifetime: Option<ScopeLifetime>,
+    new_for_client: bool,
+) -> bool {
+    if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
+        return false;
+    }
+    if entity_ticks.is_some_and(|ticks| ticks.components.contains(component_index)) {
+        return false;
+    }
+    hidden_lifetime.is_none_or(|l| l == ScopeLifetime::AlwaysPresent && new_for_client)
+}
+
+/// Lifetimes of the filters that hide an entity and each of its components, cached per [`FiltersMask`].
+///
+/// Clients that see an entity usually share a few masks, such as one for its owner and one for
+/// everyone else, so the lifetimes are computed once per mask instead of once per client.
+#[derive(Default)]
+struct HiddenLifetimes {
+    /// Masks with their lifetimes.
+    masks: Vec<MaskLifetimes>,
+
+    /// Lifetimes that hide each component of the entity, in the order of its components.
+    components: Vec<Option<ScopeLifetime>>,
+}
+
+impl HiddenLifetimes {
+    fn clear(&mut self) {
+        self.masks.clear();
+        self.components.clear();
+    }
+
+    /// Returns the lifetime that hides the entity and the lifetimes that hide each component.
+    fn get(
+        &mut self,
+        mask: FiltersMask,
+        registry: &FilterRegistry,
+        components: &[EntityComponent],
+    ) -> (Option<ScopeLifetime>, &[Option<ScopeLifetime>]) {
+        let index =
+            match self
+                .masks
+                .iter()
+                .position(|lifetimes| lifetimes.mask == mask)
+            {
+                Some(index) => index,
+                None => {
+                    let start = self.components.len();
+                    self.components.extend(components.iter().map(|component| {
+                        mask.hidden_component_lifetime(registry, component.index)
+                    }));
+                    self.masks.push(MaskLifetimes {
+                        mask,
+                        entity: mask.hidden_entity_lifetime(registry),
+                        components: start..self.components.len(),
+                    });
+                    self.masks.len() - 1
+                }
+            };
+
+        let lifetimes = &self.masks[index];
+        (
+            lifetimes.entity,
+            &self.components[lifetimes.components.clone()],
+        )
+    }
+}
+
+struct MaskLifetimes {
+    mask: FiltersMask,
+
+    /// Lifetime that hides the entity.
+    entity: Option<ScopeLifetime>,
+
+    /// Range of the component lifetimes in [`HiddenLifetimes::components`].
+    components: Range<usize>,
+}
+
+/// Client data for [`collect_changes`], stored by [`VisibilityIndex`] slot.
+struct ReplicationClient<'a> {
+    entity: Entity,
+    updates: &'a mut Updates,
+    mutations: &'a mut Mutations,
+    ticks: &'a mut ClientTicks,
+    priority_map: &'a PriorityMap,
+    visibility: &'a ClientVisibility,
+}
+
+/// A replicated component of the entity [`collect_changes`] is processing.
+struct EntityComponent<'a> {
+    rule: ComponentRule,
+    index: ComponentIndex,
+    id: ComponentId,
+    erased: ErasedComponent<'a>,
+    ticks: ComponentTicks,
+    /// Range of the full snapshot, if it was already serialized for some client.
+    range: Option<Range<usize>>,
 }
 
 fn update_ticks(
