@@ -792,8 +792,8 @@ pub mod prelude {
 
     #[cfg(feature = "server")]
     pub use super::server::{
-        AuthorizedClient, PriorityMap, ReplicatePriority, ServerPlugin, ServerSystems,
-        message::ServerMessagePlugin, related_entities::SyncRelatedAppExt,
+        AuthorizedClient, MutateInterval, PriorityMap, ReplicatePriority, ServerPlugin,
+        ServerSystems, message::ServerMessagePlugin, related_entities::SyncRelatedAppExt,
         visibility::AppVisibilityExt,
     };
 

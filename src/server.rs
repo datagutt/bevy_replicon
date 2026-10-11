@@ -455,6 +455,7 @@ fn prepare_messages(
 
 /// Collects and writes any new entity mappings that happened in this tick.
 fn collect_mappings(
+    server_tick: Res<ServerTick>,
     despawn_buffer: Res<DespawnBuffer>,
     registry: Res<FilterRegistry>,
     mut serialized: ResMut<SerializedData>,
@@ -464,6 +465,7 @@ fn collect_mappings(
         &mut Updates,
         &mut ClientTicks,
         &mut ClientVisibility,
+        Option<&MutateInterval>,
     )>,
 ) -> Result<()> {
     for (entity, signature) in entities {
@@ -471,10 +473,13 @@ fn collect_mappings(
         let mut mapping_range = None;
 
         if let Some(client) = signature.client() {
-            let Ok((_, mut message, ticks, visibility)) = clients.get_mut(client) else {
+            let Ok((_, mut message, ticks, visibility, interval)) = clients.get_mut(client) else {
                 continue;
             };
-            if should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks) {
+            // Mappings go out with the entity, which waits for a due tick.
+            if interval.is_none_or(|i| i.is_due(**server_tick))
+                && should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks)
+            {
                 trace!(
                     "writing mapping `{entity}` to 0x{hash:016x} dedicated for client `{client}`"
                 );
@@ -483,8 +488,10 @@ fn collect_mappings(
                 message.add_mapping(mapping_range);
             }
         } else {
-            for (client, mut message, ticks, visibility) in &mut clients {
-                if should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks) {
+            for (client, mut message, ticks, visibility, interval) in &mut clients {
+                if interval.is_none_or(|i| i.is_due(**server_tick))
+                    && should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks)
+                {
                     trace!("writing mapping `{entity}` to 0x{hash:016x} for client `{client}`");
                     let mapping_range =
                         serialized.write_cached_mapping(&mut mapping_range, entity, hash)?;
@@ -771,6 +778,7 @@ fn collect_changes(
         &mut Mutations,
         &mut ClientTicks,
         &PriorityMap,
+        Option<&MutateInterval>,
         &mut ClientVisibility,
     )>,
 ) -> Result<()> {
@@ -781,7 +789,7 @@ fn collect_changes(
 
     let mut active_slots = SlotMask::default();
     let mut slots = Vec::new();
-    for (client, updates, mutations, ticks, priority_map, visibility) in &mut clients {
+    for (client, updates, mutations, ticks, priority_map, interval, visibility) in &mut clients {
         let Some(slot) = visibility.slot else {
             debug_assert!(
                 false,
@@ -800,6 +808,7 @@ fn collect_changes(
             ticks: ticks.into_inner(),
             priority_map,
             visibility: visibility.into_inner(),
+            due: interval.is_none_or(|i| i.is_due(**server_tick)),
         });
     }
 
@@ -924,6 +933,14 @@ fn collect_changes(
 
                 let new_for_client = current_ticks.is_none();
                 let has_removals = current_ticks.is_some_and(|ticks| ticks.has_removals);
+
+                // Outside of the client's interval, only removals are sent, with the rest of the entity's
+                // changes to keep its update atomic. Everything else waits for the next due tick, which
+                // has to revisit this archetype even if nothing in it changes until then.
+                if !client.due && !has_removals {
+                    has_pending_replication = true;
+                    continue;
+                }
 
                 let (hidden_lifetime, component_lifetimes) = hidden_lifetimes.get(
                     client.visibility.get(entity.id()),
@@ -1170,6 +1187,7 @@ struct ReplicationClient<'a> {
     ticks: &'a mut ClientTicks,
     priority_map: &'a PriorityMap,
     visibility: &'a ClientVisibility,
+    due: bool,
 }
 
 /// A replicated component of the entity [`collect_changes`] is processing.
@@ -1228,10 +1246,11 @@ fn send_messages(
         &mut Mutations,
         &ConnectedClient,
         &mut ClientTicks,
+        Option<&MutateInterval>,
     )>,
 ) -> Result<()> {
     let mut server_tick_range = None;
-    for (client, updates, mut mutations, connected, mut ticks) in &mut clients {
+    for (client, updates, mut mutations, connected, mut ticks, interval) in &mut clients {
         if !updates.is_empty() {
             ticks.update_tick = **server_tick;
             let server_tick_range =
@@ -1246,7 +1265,10 @@ fn send_messages(
             )?;
         }
 
-        if !mutations.is_empty() || **track_mutate_messages {
+        // Ticks outside the interval send no empty messages: the client would count
+        // them as fully applied, as if no entity it sees had changed.
+        let due = interval.is_none_or(|i| i.is_due(**server_tick));
+        if !mutations.is_empty() || (**track_mutate_messages && due) {
             let server_tick_range =
                 serialized.write_cached_tick(&mut server_tick_range, **server_tick)?;
 
@@ -1414,6 +1436,57 @@ pub struct AuthorizedClient;
 /// See its documentation for more details.
 #[derive(Component, Reflect, Deref, DerefMut, Default, Debug, Clone, Copy)]
 pub struct ReplicatePriority(pub f32);
+
+/// Replicates to an authorized client only on every `interval`th [`ServerTick`].
+///
+/// The client receives replication on the ticks where the tick modulo `interval` equals
+/// `offset` modulo `interval`. Without this component, it receives it on every tick. Giving
+/// clients different offsets spreads the work over the ticks.
+///
+/// This lowers the bandwidth and the server's work for clients that do with fewer updates, such
+/// as clients in a crowded area. Nothing is lost: mutations, insertions, newly visible entities
+/// and entity mappings wait for the next due tick and then go out with their latest state.
+///
+/// Despawns and removals are still sent on every tick, together with the rest of the changes of
+/// an entity with a removal, which keeps its update atomic. Sending them right away keeps the
+/// client from acting on an entity or component that no longer exists.
+///
+/// With [`ServerPlugin::track_mutate_messages`], empty mutate messages are sent only on due
+/// ticks, so the client never treats a tick it received nothing for as fully applied.
+///
+/// Unrelated to [`ReplicatePriority`] and [`PriorityMap`], which delay mutations by the time
+/// since the last acknowledgment instead.
+#[derive(Component, Reflect, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutateInterval {
+    interval: u32,
+    offset: u32,
+}
+
+impl MutateInterval {
+    /// Creates an interval of `interval` ticks, starting on the ticks where the tick modulo
+    /// `interval` equals `offset` modulo `interval`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero.
+    pub fn new(interval: u32, offset: u32) -> Self {
+        assert_ne!(interval, 0, "mutate interval should be at least 1");
+        Self {
+            interval,
+            offset: offset % interval,
+        }
+    }
+
+    /// Returns the number of ticks between mutations.
+    pub fn interval(&self) -> u32 {
+        self.interval
+    }
+
+    /// Returns `true` if the client should receive replication on the given tick.
+    pub fn is_due(&self, tick: RepliconTick) -> bool {
+        tick.get() % self.interval == self.offset
+    }
+}
 
 /// Controls how often mutations are sent for an authorized client.
 ///
