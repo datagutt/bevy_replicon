@@ -24,6 +24,19 @@ pub struct ClientVisibility {
 
     /// Invalidates the archetype fast path, including when visibility is regained.
     pub(crate) changed: bool,
+
+    /// Entities whose mask changed since the last
+    /// [`VisibilityIndex`](super::index::VisibilityIndex) update.
+    ///
+    /// May contain duplicates.
+    #[reflect(ignore)]
+    pub(crate) changed_entities: Vec<Entity>,
+
+    /// Position of this client in [`VisibilityIndex`](super::index::VisibilityIndex).
+    ///
+    /// Assigned on the first index update after insertion.
+    #[reflect(ignore)]
+    pub(crate) slot: Option<usize>,
 }
 
 impl ClientVisibility {
@@ -146,7 +159,10 @@ impl ClientVisibility {
     pub fn set(&mut self, entity: Entity, bit: FilterBit, visible: bool) {
         if visible {
             if let Entry::Occupied(mut mask) = self.hidden.entry(entity) {
-                self.changed |= mask.get().contains(bit);
+                if mask.get().contains(bit) {
+                    self.changed = true;
+                    self.changed_entities.push(entity);
+                }
                 mask.get_mut().remove(bit);
                 if mask.get().is_empty() {
                     mask.remove();
@@ -164,6 +180,7 @@ impl ClientVisibility {
             if !mask.contains(bit) {
                 self.changed = true;
                 mask.insert(bit);
+                self.changed_entities.push(entity);
                 self.lost.entry(entity).or_default().insert(bit);
             }
         }
